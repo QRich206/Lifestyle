@@ -1,0 +1,886 @@
+//@version=6
+strategy("Master Strategy Engine — Backtest Strategy V1", shorttitle="MSE Backtest V1", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.5, slippage=1,
+     pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     max_labels_count=100, max_lines_count=200, max_bars_back=2000)
+
+// ============================================================================
+// HELPER FUNCTIONS (pure, parameterized — defined before use)
+// ============================================================================
+f_clip100(v) =>
+    math.max(0.0, math.min(100.0, v))
+
+f_nearestAbove(c, l1, l2, l3, l4, l5) =>
+    arr = array.new<float>()
+    if not na(l1) and l1 > c
+        array.push(arr, l1)
+    if not na(l2) and l2 > c
+        array.push(arr, l2)
+    if not na(l3) and l3 > c
+        array.push(arr, l3)
+    if not na(l4) and l4 > c
+        array.push(arr, l4)
+    if not na(l5) and l5 > c
+        array.push(arr, l5)
+    float result = na
+    if array.size(arr) > 0
+        result := array.min(arr)
+    result
+
+f_nearestBelow(c, l1, l2, l3, l4, l5) =>
+    arr = array.new<float>()
+    if not na(l1) and l1 < c
+        array.push(arr, l1)
+    if not na(l2) and l2 < c
+        array.push(arr, l2)
+    if not na(l3) and l3 < c
+        array.push(arr, l3)
+    if not na(l4) and l4 < c
+        array.push(arr, l4)
+    if not na(l5) and l5 < c
+        array.push(arr, l5)
+    float result = na
+    if array.size(arr) > 0
+        result := array.max(arr)
+    result
+
+f_findSweepLongLevel(lo, cl, l1, l2, l3, l4, l5) =>
+    arr = array.new<float>()
+    if not na(l1) and lo < l1 and cl > l1
+        array.push(arr, l1)
+    if not na(l2) and lo < l2 and cl > l2
+        array.push(arr, l2)
+    if not na(l3) and lo < l3 and cl > l3
+        array.push(arr, l3)
+    if not na(l4) and lo < l4 and cl > l4
+        array.push(arr, l4)
+    if not na(l5) and lo < l5 and cl > l5
+        array.push(arr, l5)
+    float result = na
+    if array.size(arr) > 0
+        result := array.max(arr)
+    result
+
+f_findSweepShortLevel(hi, cl, l1, l2, l3, l4, l5) =>
+    arr = array.new<float>()
+    if not na(l1) and hi > l1 and cl < l1
+        array.push(arr, l1)
+    if not na(l2) and hi > l2 and cl < l2
+        array.push(arr, l2)
+    if not na(l3) and hi > l3 and cl < l3
+        array.push(arr, l3)
+    if not na(l4) and hi > l4 and cl < l4
+        array.push(arr, l4)
+    if not na(l5) and hi > l5 and cl < l5
+        array.push(arr, l5)
+    float result = na
+    if array.size(arr) > 0
+        result := array.min(arr)
+    result
+
+f_stopPrice(mode, isLong, entryPx, atrV, atrMult, structLevel, vwapV, emaSlowV, orH, orL, customTicks, tick) =>
+    float s = na
+    if mode == "ATR"
+        s := isLong ? entryPx - atrV * atrMult : entryPx + atrV * atrMult
+    else if mode == "Structure"
+        s := not na(structLevel) ? structLevel : (isLong ? entryPx - atrV * atrMult : entryPx + atrV * atrMult)
+    else if mode == "Opening Range"
+        s := isLong ? (not na(orL) ? orL : entryPx - atrV * atrMult) : (not na(orH) ? orH : entryPx + atrV * atrMult)
+    else if mode == "VWAP/EMA"
+        s := isLong ? math.min(vwapV, emaSlowV) : math.max(vwapV, emaSlowV)
+    else if mode == "Sweep Wick"
+        s := not na(structLevel) ? structLevel : (isLong ? entryPx - atrV * atrMult : entryPx + atrV * atrMult)
+    else
+        s := isLong ? entryPx - customTicks * tick : entryPx + customTicks * tick
+    s
+
+f_targetPrice(mode, isLong, entryPx, stopPx, structLevel, sessH, sessL, pdH, pdL, pmH, pmL, orH, orL) =>
+    rDist = math.abs(entryPx - stopPx)
+    float t = na
+    if mode == "1R"
+        t := isLong ? entryPx + rDist : entryPx - rDist
+    else if mode == "2R"
+        t := isLong ? entryPx + rDist * 2 : entryPx - rDist * 2
+    else if mode == "Swing High/Low"
+        t := not na(structLevel) ? structLevel : (isLong ? entryPx + rDist * 2 : entryPx - rDist * 2)
+    else if mode == "Session High/Low"
+        t := isLong ? (not na(sessH) ? sessH : entryPx + rDist * 2) : (not na(sessL) ? sessL : entryPx - rDist * 2)
+    else if mode == "Previous Day High/Low"
+        t := isLong ? (not na(pdH) ? pdH : entryPx + rDist * 2) : (not na(pdL) ? pdL : entryPx - rDist * 2)
+    else if mode == "Premarket High/Low"
+        t := isLong ? (not na(pmH) ? pmH : entryPx + rDist * 2) : (not na(pmL) ? pmL : entryPx - rDist * 2)
+    else
+        orRange = (not na(orH) and not na(orL)) ? orH - orL : rDist * 2
+        t := isLong ? (not na(orH) ? orH + orRange : entryPx + rDist * 2) : (not na(orL) ? orL - orRange : entryPx - rDist * 2)
+    t
+
+f_entryAlert(stratName, action, side, stopPx, targetPx, score, qty) =>
+    '{"symbol":"{{ticker}}","strategy":"' + stratName + '","action":"' + action + '","side":"' + side +
+     '","order_type":"market","qty":"' + str.tostring(qty) + '","stop":"' + str.tostring(stopPx, format.mintick) +
+     '","target":"' + str.tostring(targetPx, format.mintick) + '","score":"' + str.tostring(score, "#.#") +
+     '","time":"{{time}}"}'
+
+f_exitAlert(reason) =>
+    '{"symbol":"{{ticker}}","strategy":"Exit","action":"close","reason":"' + reason + '","time":"{{time}}"}'
+
+f_marketHint(mode) =>
+    switch mode
+        "ES/MES" => "ATR 1.5-2.0 | Score 65-70"
+        "NQ/MNQ" => "ATR 2.0-2.75 | Score 70 | VWAP align rec."
+        "YM/MYM" => "ATR 1.5-2.0 | Score 60-65"
+        "CL/MCL" => "ATR 2.25-3.0 | Score 70 | VWAP align rec. | wider stop"
+        "GC/MGC" => "ATR 1.75-2.5 | Score 65-70 | VWAP align rec."
+        => "Custom - user defined"
+
+// ============================================================================
+// INPUTS — MARKET MODE & GENERAL
+// ============================================================================
+marketMode = input.string("ES/MES", "Market Mode", options=["ES/MES", "NQ/MNQ", "YM/MYM", "CL/MCL", "GC/MGC", "Custom"], group="Market Mode",
+     tooltip="Adjusts informational scoring hints only. All stop/score values below remain fully editable regardless of this selection.")
+
+qtyInput = input.int(1, "Order Quantity (Contracts)", minval=1, group="General")
+allowLongs = input.bool(true, "Allow Long Entries", group="General")
+allowShorts = input.bool(true, "Allow Short Entries", group="General")
+oneTradeAtATimeNote = input.bool(true, "One Trade At A Time (always enforced structurally)", group="General",
+     tooltip="This is enforced by the engine regardless of this toggle. Shown for visibility only.")
+
+// ============================================================================
+// INPUTS — SESSION
+// ============================================================================
+sessionInput = input.session("0930-1600", "Regular Session", group="Session")
+premarketSessionInput = input.session("0400-0930", "Premarket Session", group="Session")
+sessionTimezone = input.string("America/New_York", "Session Timezone", group="Session")
+restrictEntriesToSession = input.bool(true, "Only Enter During Regular Session", group="Session")
+flattenAtSessionEnd = input.bool(true, "Flatten Position At Session End", group="Session")
+useNoTradeCutoff = input.bool(true, "Enable No-New-Trades Cutoff", group="Session")
+noTradeCutoffHour = input.int(15, "No New Trades After — Hour (24h, session tz)", minval=0, maxval=23, group="Session")
+noTradeCutoffMinute = input.int(50, "No New Trades After — Minute", minval=0, maxval=59, group="Session")
+
+// ============================================================================
+// INPUTS — RISK MANAGEMENT
+// ============================================================================
+maxTradesPerDay = input.int(3, "Max Trades Per Day", minval=1, group="Risk Management")
+maxLossesPerDay = input.int(2, "Max Losses Per Day (0 = disabled)", minval=0, group="Risk Management")
+dailyLossLimit = input.float(500, "Daily Loss Limit ($, 0 = disabled)", minval=0, group="Risk Management")
+stopAfterTPCount = input.int(0, "Stop Trading After N Wins (0 = disabled)", minval=0, group="Risk Management")
+stopAfterLossCount = input.int(0, "Stop Trading After N Losses (0 = disabled)", minval=0, group="Risk Management")
+allowConflictTrades = input.bool(false, "Allow Conflict Trades (pick higher-scoring side instead of skipping)", group="Risk Management")
+
+// ============================================================================
+// INPUTS — STOP LOSS / TAKE PROFIT (GLOBAL, used by EMA/VWAP-Rev/Fakeout/Sweep)
+// ============================================================================
+stopMode = input.string("ATR", "Stop Mode", options=["ATR", "Structure", "Opening Range", "VWAP/EMA", "Sweep Wick", "Custom Fallback"], group="Stop Loss / Take Profit")
+tpMode = input.string("2R", "Take Profit Mode", options=["1R", "2R", "Swing High/Low", "Session High/Low", "Previous Day High/Low", "Premarket High/Low", "OR Measured Move"], group="Stop Loss / Take Profit")
+atrLen = input.int(14, "ATR Length", minval=1, group="Stop Loss / Take Profit")
+atrMultStop = input.float(2.0, "ATR Stop Multiplier", minval=0.1, step=0.05, group="Stop Loss / Take Profit",
+     tooltip="Suggested ranges — ES/MES 1.5-2.0 | NQ/MNQ 2.0-2.75 | YM/MYM 1.5-2.0 | CL/MCL 2.25-3.0 | GC/MGC 1.75-2.5")
+customStopTicks = input.float(40, "Custom Fallback Stop (ticks)", minval=1, group="Stop Loss / Take Profit")
+
+// ============================================================================
+// INPUTS — EMA/VWAP CONTINUATION MODULE
+// ============================================================================
+enableEMAContinuation = input.bool(true, "Enable EMA/VWAP Continuation", group="EMA/VWAP Continuation")
+emaFastLen = input.int(9, "EMA Fast Length", group="EMA/VWAP Continuation")
+emaSlowLen = input.int(20, "EMA Slow Length", group="EMA/VWAP Continuation")
+useRSIFilterEMA = input.bool(false, "Use RSI Confirmation (OFF preserves original behavior)", group="EMA/VWAP Continuation")
+rsiLen = input.int(14, "RSI Length", group="EMA/VWAP Continuation")
+useVolFilterEMA = input.bool(false, "Use Volume Confirmation (OFF preserves original behavior)", group="EMA/VWAP Continuation")
+volAvgLen = input.int(20, "Volume Average Length", group="EMA/VWAP Continuation")
+volMultEMA = input.float(1.2, "Volume Confirmation Multiplier", group="EMA/VWAP Continuation")
+useSessionFilterEMA = input.bool(false, "Use Session Filter (OFF preserves original behavior)", group="EMA/VWAP Continuation")
+useScoreFilterEMA = input.bool(false, "Use Score Filter (OFF = score is informational only)", group="EMA/VWAP Continuation")
+emaScoreThreshold = input.int(65, "EMA Score Threshold", minval=0, maxval=100, group="EMA/VWAP Continuation")
+useVWAPAlignFilterEMA = input.bool(false, "Optional: VWAP Alignment Filter", group="EMA/VWAP Continuation")
+useRRFilterEMA = input.bool(false, "Optional: Risk/Reward Filter", group="EMA/VWAP Continuation")
+minRR_EMA = input.float(1.5, "Optional: Minimum R:R", group="EMA/VWAP Continuation")
+useCandleStrengthFilterEMA = input.bool(false, "Optional: Candle Strength Filter", group="EMA/VWAP Continuation")
+minBodyPctEMA = input.float(50, "Optional: Minimum Body %", group="EMA/VWAP Continuation")
+useLunchFilterEMA = input.bool(false, "Optional: Lunch Hour Filter (12:00-13:00)", group="EMA/VWAP Continuation")
+useHTFFilterEMA = input.bool(false, "Optional: Higher Timeframe Filter", group="EMA/VWAP Continuation")
+htfTF = input.timeframe("60", "Higher Timeframe", group="EMA/VWAP Continuation")
+useChopFilterEMA = input.bool(false, "Optional: Chop Filter", group="EMA/VWAP Continuation")
+chopThresholdEMA = input.int(60, "Optional: Chop Threshold (suppress above)", minval=0, maxval=100, group="EMA/VWAP Continuation")
+
+// ============================================================================
+// INPUTS — ORB BREAKOUT MODULE
+// ============================================================================
+enableORB = input.bool(true, "Enable ORB Breakout", group="ORB Breakout")
+orbLengthStr = input.string("15", "Opening Range Length (min)", options=["5", "15", "30", "60"], group="ORB Breakout")
+orbCloseConfirm = input.bool(true, "Require Close Confirmation", group="ORB Breakout")
+orbVolConfirm = input.bool(false, "Require Volume Confirmation", group="ORB Breakout")
+orbVWAPAlign = input.bool(false, "Require VWAP Alignment", group="ORB Breakout")
+orbHTFAlign = input.bool(false, "Require HTF Alignment", group="ORB Breakout")
+useScoreFilterORB = input.bool(false, "Use Score Filter (OFF = score is informational only)", group="ORB Breakout")
+orbMinScore = input.int(65, "Minimum ORB Score", minval=0, maxval=100, group="ORB Breakout")
+orbMaxAttemptsPerDay = input.int(2, "Max ORB Attempts Per Day", minval=1, group="ORB Breakout")
+orbOneTradePerDirection = input.bool(true, "One ORB Trade Per Direction", group="ORB Breakout")
+orbStopMode = input.string("Opposite Side of OR", "ORB Stop Mode", options=["Opposite Side of OR", "OR Midpoint", "ATR Stop", "Breakout Candle Low/High"], group="ORB Breakout")
+orbTPMode = input.string("2R", "ORB Take Profit Mode", options=["1R", "2R", "Swing High/Low", "Session High/Low", "Previous Day High/Low", "Premarket High/Low", "OR Measured Move"], group="ORB Breakout")
+
+// ============================================================================
+// INPUTS — VWAP MEAN REVERSION MODULE
+// ============================================================================
+enableVWAPRev = input.bool(true, "Enable VWAP Mean Reversion", group="VWAP Mean Reversion")
+bandMult1 = input.float(2.0, "VWAP Band Multiplier (trigger band)", group="VWAP Mean Reversion")
+bandMult2 = input.float(3.0, "VWAP Band Multiplier 2 (visual only)", group="VWAP Mean Reversion")
+vwapRevRSIFilter = input.bool(false, "Optional: RSI Filter", group="VWAP Mean Reversion")
+vwapRevVolFadeFilter = input.bool(false, "Optional: Volume Fade Filter", group="VWAP Mean Reversion")
+vwapRevNearLevelFilter = input.bool(false, "Optional: Near Support/Resistance Filter", group="VWAP Mean Reversion")
+suppressInStrongTrend = input.bool(true, "Suppress During Strong Trend", group="VWAP Mean Reversion")
+useScoreFilterVWAPRev = input.bool(false, "Use Score Filter (OFF = score is informational only)", group="VWAP Mean Reversion")
+vwapRevMinScore = input.int(65, "Minimum VWAP Reversion Score", minval=0, maxval=100, group="VWAP Mean Reversion")
+
+// ============================================================================
+// INPUTS — OPENING RANGE FAKEOUT MODULE
+// ============================================================================
+enableFakeout = input.bool(true, "Enable Opening Range Fakeout", group="Opening Range Fakeout")
+useScoreFilterFakeout = input.bool(false, "Use Score Filter (OFF = score is informational only)", group="Opening Range Fakeout")
+fakeoutMinScore = input.int(65, "Minimum Fakeout Score", minval=0, maxval=100, group="Opening Range Fakeout")
+
+// ============================================================================
+// INPUTS — LIQUIDITY SWEEP REVERSAL MODULE
+// ============================================================================
+enableSweep = input.bool(true, "Enable Liquidity Sweep Reversal", group="Liquidity Sweep Reversal")
+swingLookback = input.int(10, "Swing Pivot Lookback (each side)", minval=1, group="Liquidity Sweep Reversal")
+sweepVolFilter = input.bool(false, "Optional: Volume Spike Filter", group="Liquidity Sweep Reversal")
+sweepVWAPFilter = input.bool(false, "Optional: VWAP Band Filter", group="Liquidity Sweep Reversal")
+useScoreFilterSweep = input.bool(false, "Use Score Filter (OFF = score is informational only)", group="Liquidity Sweep Reversal")
+sweepMinScore = input.int(65, "Minimum Sweep Score", minval=0, maxval=100, group="Liquidity Sweep Reversal")
+
+// ============================================================================
+// INPUTS — EXIT RULES
+// ============================================================================
+useEmergencyEMACross = input.bool(false, "Emergency Exit: Opposite EMA Cross", group="Exit Rules")
+useEmergencyVWAP = input.bool(false, "Emergency Exit: VWAP Loss/Reclaim", group="Exit Rules")
+useORBFailureExit = input.bool(false, "Emergency Exit: ORB Failure Back Inside Range", group="Exit Rules")
+useOppositeSignalExit = input.bool(false, "Emergency Exit: Opposite Strategy Signal", group="Exit Rules")
+useExitRiskAsExit = input.bool(false, "Use Exit Risk Score As Actual Exit (default: warn only)", group="Exit Rules")
+exitWatchScore = input.int(55, "Exit Watch Score", minval=0, maxval=100, group="Exit Rules")
+exitWarningScore = input.int(70, "Exit Warning Score", minval=0, maxval=100, group="Exit Rules")
+exitRiskExitThreshold = input.int(80, "Exit Risk Exit Threshold", minval=0, maxval=100, group="Exit Rules")
+
+// ============================================================================
+// INPUTS — VISUALS
+// ============================================================================
+showTable = input.bool(true, "Show Info Table", group="Visuals")
+showBackground = input.bool(false, "Show Signal Background", group="Visuals")
+
+tick = syminfo.mintick
+orbLengthMinutes = orbLengthStr == "5" ? 5 : orbLengthStr == "15" ? 15 : orbLengthStr == "30" ? 30 : 60
+
+// ============================================================================
+// SESSION / TIME
+// ============================================================================
+inSession = not na(time(timeframe.period, sessionInput, sessionTimezone))
+sessionJustStarted = inSession and not inSession[1]
+sessionJustEnded = (not inSession) and inSession[1]
+
+inPremarket = not na(time(timeframe.period, premarketSessionInput, sessionTimezone))
+premarketJustStarted = inPremarket and not inPremarket[1]
+
+currentHM = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
+cutoffHM = noTradeCutoffHour * 60 + noTradeCutoffMinute
+afterCutoff = useNoTradeCutoff and currentHM >= cutoffHM
+
+// ============================================================================
+// CORE INDICATORS
+// ============================================================================
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+emaCrossUp = ta.crossover(emaFast, emaSlow)
+emaCrossDn = ta.crossunder(emaFast, emaSlow)
+emaSlope = emaFast - emaFast[3]
+emaSeparation = math.abs(emaFast - emaSlow)
+emaSeparationAvg = ta.sma(emaSeparation, 20)
+emaCompression = emaSeparation < emaSeparationAvg * 0.6
+emaExpansion = emaSeparation > emaSeparationAvg * 1.4
+
+rsiVal = ta.rsi(close, rsiLen)
+rsiRising = rsiVal > rsiVal[1]
+rsiFalling = rsiVal < rsiVal[1]
+
+volAvg = ta.sma(volume, volAvgLen)
+relVol = volAvg > 0 ? volume / volAvg : 1.0
+volConfirm = volume > volAvg * volMultEMA
+
+atrVal = ta.atr(atrLen)
+
+barRange = high - low
+bodySize = math.abs(close - open)
+bodyPct = barRange != 0 ? bodySize / barRange * 100 : 0
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+upperWickPct = barRange != 0 ? upperWick / barRange * 100 : 0
+lowerWickPct = barRange != 0 ? lowerWick / barRange * 100 : 0
+
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+chopScore = f_clip100(100 - adxVal * 2)
+strongTrend = adxVal > 25 and emaSeparation > atrVal * 1.0
+
+// VWAP with session-anchored cumulative bands (no repaint — uses only current+prior bar accumulation)
+var float cumVol = 0.0
+var float cumPV = 0.0
+var float cumPV2 = 0.0
+if sessionJustStarted or bar_index == 0
+    cumVol := 0.0
+    cumPV := 0.0
+    cumPV2 := 0.0
+cumVol += volume
+cumPV += volume * hlc3
+cumPV2 += volume * hlc3 * hlc3
+vwapVal = cumVol > 0 ? cumPV / cumVol : hlc3
+vwapVariance = cumVol > 0 ? math.max(cumPV2 / cumVol - vwapVal * vwapVal, 0) : 0
+vwapStdev = math.sqrt(vwapVariance)
+upperBand1 = vwapVal + bandMult1 * vwapStdev
+lowerBand1 = vwapVal - bandMult1 * vwapStdev
+upperBand2 = vwapVal + bandMult2 * vwapStdev
+lowerBand2 = vwapVal - bandMult2 * vwapStdev
+vwapReclaimLong = ta.crossover(close, vwapVal)
+vwapLossShort = ta.crossunder(close, vwapVal)
+upperBandTouch = high >= upperBand1
+lowerBandTouch = low <= lowerBand1
+upperBandRejection = high >= upperBand1 and close < upperBand1
+lowerBandRejection = low <= lowerBand1 and close > lowerBand1
+
+// ============================================================================
+// HTF & PREVIOUS DAY (non-repainting security calls)
+// ============================================================================
+[htfEMA9, htfEMA20] = request.security(syminfo.tickerid, htfTF, [ta.ema(close, 9), ta.ema(close, 20)], lookahead=barmerge.lookahead_off)
+htfBullish = htfEMA9 > htfEMA20
+htfBearish = htfEMA9 < htfEMA20
+
+[pdHigh, pdLow, pdClose] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
+
+// ============================================================================
+// OPENING RANGE / SESSION HIGH-LOW / PREMARKET
+// ============================================================================
+var float orHigh = na
+var float orLow = na
+var bool orComplete = false
+var float sessionStartTime = na
+
+if sessionJustStarted
+    sessionStartTime := time
+    orHigh := high
+    orLow := low
+    orComplete := false
+
+minutesSinceOpen = inSession and not na(sessionStartTime) ? (time - sessionStartTime) / 60000 : na
+inORWindow = inSession and not na(minutesSinceOpen) and minutesSinceOpen <= orbLengthMinutes
+
+if inORWindow
+    orHigh := math.max(orHigh, high)
+    orLow := math.min(orLow, low)
+if inSession and not inORWindow and not orComplete
+    orComplete := true
+
+var float sessHigh = na
+var float sessLow = na
+if sessionJustStarted
+    sessHigh := high
+    sessLow := low
+else if inSession
+    sessHigh := math.max(sessHigh, high)
+    sessLow := math.min(sessLow, low)
+
+var float pmHigh = na
+var float pmLow = na
+if premarketJustStarted
+    pmHigh := high
+    pmLow := low
+else if inPremarket
+    pmHigh := math.max(pmHigh, high)
+    pmLow := math.min(pmLow, low)
+
+// ============================================================================
+// SWING PIVOTS / STRUCTURE
+// ============================================================================
+swingH = ta.pivothigh(high, swingLookback, swingLookback)
+swingL = ta.pivotlow(low, swingLookback, swingLookback)
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var float prevSwingHigh = na
+var float prevSwingLow = na
+var bool lastHH = false
+var bool lastLH = false
+var bool lastHL = false
+var bool lastLL = false
+
+if not na(swingH)
+    lastHH := not na(prevSwingHigh) and swingH > prevSwingHigh
+    lastLH := not na(prevSwingHigh) and swingH < prevSwingHigh
+    prevSwingHigh := swingH
+    lastSwingHigh := swingH
+if not na(swingL)
+    lastHL := not na(prevSwingLow) and swingL > prevSwingLow
+    lastLL := not na(prevSwingLow) and swingL < prevSwingLow
+    prevSwingLow := swingL
+    lastSwingLow := swingL
+
+nearestResistance = f_nearestAbove(close, pdHigh, pmHigh, sessHigh, orHigh, lastSwingHigh)
+nearestSupport = f_nearestBelow(close, pdLow, pmLow, sessLow, orLow, lastSwingLow)
+roomToResistanceATR = not na(nearestResistance) and atrVal > 0 ? (nearestResistance - close) / atrVal : na
+roomToSupportATR = not na(nearestSupport) and atrVal > 0 ? (close - nearestSupport) / atrVal : na
+nearResistance = not na(roomToResistanceATR) and roomToResistanceATR <= 1.0
+nearSupport = not na(roomToSupportATR) and roomToSupportATR <= 1.0
+
+// ============================================================================
+// MODULE 1 — EMA/VWAP CONTINUATION  (preserves original 9/20 EMA behavior by default)
+// ============================================================================
+sessionOKema = not useSessionFilterEMA or inSession
+emaBaseLong = emaCrossUp and (not useRSIFilterEMA or rsiVal > 50) and (not useVolFilterEMA or volConfirm) and sessionOKema
+emaBaseShort = emaCrossDn and (not useRSIFilterEMA or rsiVal < 50) and (not useVolFilterEMA or volConfirm) and sessionOKema
+
+vwapAlignLongOK = not useVWAPAlignFilterEMA or close > vwapVal
+vwapAlignShortOK = not useVWAPAlignFilterEMA or close < vwapVal
+candleStrengthLongOK = not useCandleStrengthFilterEMA or (close > open and bodyPct >= minBodyPctEMA)
+candleStrengthShortOK = not useCandleStrengthFilterEMA or (close < open and bodyPct >= minBodyPctEMA)
+lunchOK = not useLunchFilterEMA or hour(time, sessionTimezone) != 12
+htfLongOK = not useHTFFilterEMA or htfBullish
+htfShortOK = not useHTFFilterEMA or htfBearish
+chopOKema = not useChopFilterEMA or chopScore < chopThresholdEMA
+rrLongOKema = not useRRFilterEMA or (not na(roomToResistanceATR) and roomToResistanceATR / atrMultStop >= minRR_EMA)
+rrShortOKema = not useRRFilterEMA or (not na(roomToSupportATR) and roomToSupportATR / atrMultStop >= minRR_EMA)
+
+emaLongFiltered = emaBaseLong and vwapAlignLongOK and candleStrengthLongOK and lunchOK and htfLongOK and chopOKema and rrLongOKema
+emaShortFiltered = emaBaseShort and vwapAlignShortOK and candleStrengthShortOK and lunchOK and htfShortOK and chopOKema and rrShortOKema
+
+emaScoreLong = f_clip100(50 + (emaSlope > 0 ? 10 : 0) + (close > vwapVal ? 10 : 0) + (rsiVal > 50 ? 10 : 0) + (relVol > 1 ? 10 : 0) + (htfBullish ? 10 : 0) - (chopScore > 60 ? 15 : 0))
+emaScoreShort = f_clip100(50 + (emaSlope < 0 ? 10 : 0) + (close < vwapVal ? 10 : 0) + (rsiVal < 50 ? 10 : 0) + (relVol > 1 ? 10 : 0) + (htfBearish ? 10 : 0) - (chopScore > 60 ? 15 : 0))
+
+emaLongTrigger = enableEMAContinuation and emaLongFiltered and (not useScoreFilterEMA or emaScoreLong >= emaScoreThreshold)
+emaShortTrigger = enableEMAContinuation and emaShortFiltered and (not useScoreFilterEMA or emaScoreShort >= emaScoreThreshold)
+
+emaLongStructLevel = lastSwingLow
+emaShortStructLevel = lastSwingHigh
+emaLongStop = f_stopPrice(stopMode, true, close, atrVal, atrMultStop, emaLongStructLevel, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+emaShortStop = f_stopPrice(stopMode, false, close, atrVal, atrMultStop, emaShortStructLevel, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+emaLongTarget = f_targetPrice(tpMode, true, close, emaLongStop, lastSwingHigh, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+emaShortTarget = f_targetPrice(tpMode, false, close, emaShortStop, lastSwingLow, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+
+// ============================================================================
+// OR BREAKOUT EVENTS + OPENING RANGE FAKEOUT (computed together — fakeout has priority over ORB on same bar)
+// ============================================================================
+var int orbLongAttempts = 0
+var int orbShortAttempts = 0
+if sessionJustStarted
+    orbLongAttempts := 0
+    orbShortAttempts := 0
+
+orbLongEventRaw = orComplete and (orbCloseConfirm ? ta.crossover(close, orHigh) : (high > orHigh and high[1] <= orHigh))
+orbShortEventRaw = orComplete and (orbCloseConfirm ? ta.crossunder(close, orLow) : (low < orLow and low[1] >= orLow))
+
+fakeoutLongRaw = orComplete and low < orLow and close > orLow
+fakeoutShortRaw = orComplete and high > orHigh and close < orHigh
+
+orbLongEvent = orbLongEventRaw and not (enableFakeout and fakeoutShortRaw)
+orbShortEvent = orbShortEventRaw and not (enableFakeout and fakeoutLongRaw)
+
+// ---- MODULE 2 — ORB BREAKOUT ----
+orbVolOK = not orbVolConfirm or volume > volAvg
+orbVWAPOK_Long = not orbVWAPAlign or close > vwapVal
+orbVWAPOK_Short = not orbVWAPAlign or close < vwapVal
+orbHTFOK_Long = not orbHTFAlign or htfBullish
+orbHTFOK_Short = not orbHTFAlign or htfBearish
+
+orbLongGateBase = enableORB and orbLongEvent and orbVolOK and orbVWAPOK_Long and orbHTFOK_Long and orbLongAttempts < orbMaxAttemptsPerDay and (not orbOneTradePerDirection or orbLongAttempts == 0)
+orbShortGateBase = enableORB and orbShortEvent and orbVolOK and orbVWAPOK_Short and orbHTFOK_Short and orbShortAttempts < orbMaxAttemptsPerDay and (not orbOneTradePerDirection or orbShortAttempts == 0)
+
+if orbLongEvent
+    orbLongAttempts += 1
+if orbShortEvent
+    orbShortAttempts += 1
+
+orbScoreLong = f_clip100(50 + (volume > volAvg ? 10 : 0) + (close > vwapVal ? 10 : 0) + (htfBullish ? 10 : 0) + (chopScore < 50 ? 10 : 0) + (not na(roomToResistanceATR) and roomToResistanceATR > 1.5 ? 10 : 0))
+orbScoreShort = f_clip100(50 + (volume > volAvg ? 10 : 0) + (close < vwapVal ? 10 : 0) + (htfBearish ? 10 : 0) + (chopScore < 50 ? 10 : 0) + (not na(roomToSupportATR) and roomToSupportATR > 1.5 ? 10 : 0))
+
+orbLongTrigger = orbLongGateBase and (not useScoreFilterORB or orbScoreLong >= orbMinScore)
+orbShortTrigger = orbShortGateBase and (not useScoreFilterORB or orbScoreShort >= orbMinScore)
+
+f_orbStop(isLong) =>
+    float s = na
+    if orbStopMode == "Opposite Side of OR"
+        s := isLong ? orLow : orHigh
+    else if orbStopMode == "OR Midpoint"
+        s := (orHigh + orLow) / 2
+    else if orbStopMode == "ATR Stop"
+        s := isLong ? close - atrVal * atrMultStop : close + atrVal * atrMultStop
+    else
+        s := isLong ? low : high
+    s
+
+orbLongStop = f_orbStop(true)
+orbShortStop = f_orbStop(false)
+orbLongTarget = f_targetPrice(orbTPMode, true, close, orbLongStop, lastSwingHigh, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+orbShortTarget = f_targetPrice(orbTPMode, false, close, orbShortStop, lastSwingLow, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+
+// ---- MODULE 4 — OPENING RANGE FAKEOUT (finalize) ----
+fakeoutScoreLong = f_clip100(50 + (lowerWick > bodySize * 0.3 ? 15 : 0) + (not na(orHigh) and not na(orLow) and close > (orHigh + orLow) / 2 ? 15 : 0) + (rsiRising ? 10 : 0))
+fakeoutScoreShort = f_clip100(50 + (upperWick > bodySize * 0.3 ? 15 : 0) + (not na(orHigh) and not na(orLow) and close < (orHigh + orLow) / 2 ? 15 : 0) + (rsiFalling ? 10 : 0))
+
+fakeoutLongTrigger = enableFakeout and fakeoutLongRaw and (not useScoreFilterFakeout or fakeoutScoreLong >= fakeoutMinScore)
+fakeoutShortTrigger = enableFakeout and fakeoutShortRaw and (not useScoreFilterFakeout or fakeoutScoreShort >= fakeoutMinScore)
+
+fakeoutLongStop = f_stopPrice(stopMode, true, close, atrVal, atrMultStop, low, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+fakeoutShortStop = f_stopPrice(stopMode, false, close, atrVal, atrMultStop, high, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+fakeoutLongTarget = f_targetPrice(tpMode, true, close, fakeoutLongStop, orHigh, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+fakeoutShortTarget = f_targetPrice(tpMode, false, close, fakeoutShortStop, orLow, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+
+// ============================================================================
+// MODULE 3 — VWAP MEAN REVERSION
+// ============================================================================
+vwapRevShortRaw = high >= upperBand1 and close < upperBand1
+vwapRevLongRaw = low <= lowerBand1 and close > lowerBand1
+rejectionShort = upperWick > bodySize * 0.5 or upperWick > atrVal * 0.3
+rejectionLong = lowerWick > bodySize * 0.5 or lowerWick > atrVal * 0.3
+volFading = volume < volAvg
+
+vwapRevRSIOK_Short = not vwapRevRSIFilter or rsiFalling
+vwapRevRSIOK_Long = not vwapRevRSIFilter or rsiRising
+vwapRevVolOK = not vwapRevVolFadeFilter or volFading
+vwapRevNearLevelOK_Short = not vwapRevNearLevelFilter or nearResistance
+vwapRevNearLevelOK_Long = not vwapRevNearLevelFilter or nearSupport
+vwapRevAllowedInTrend = not suppressInStrongTrend or not strongTrend
+
+vwapRevScoreLong = f_clip100(50 + (rejectionLong ? 15 : 0) + (rsiRising ? 10 : 0) + (volFading ? 10 : 0) + (nearSupport ? 15 : 0) - (strongTrend ? 20 : 0))
+vwapRevScoreShort = f_clip100(50 + (rejectionShort ? 15 : 0) + (rsiFalling ? 10 : 0) + (volFading ? 10 : 0) + (nearResistance ? 15 : 0) - (strongTrend ? 20 : 0))
+
+vwapRevLongTrigger = enableVWAPRev and vwapRevLongRaw and rejectionLong and vwapRevRSIOK_Long and vwapRevVolOK and vwapRevNearLevelOK_Long and vwapRevAllowedInTrend and (not useScoreFilterVWAPRev or vwapRevScoreLong >= vwapRevMinScore)
+vwapRevShortTrigger = enableVWAPRev and vwapRevShortRaw and rejectionShort and vwapRevRSIOK_Short and vwapRevVolOK and vwapRevNearLevelOK_Short and vwapRevAllowedInTrend and (not useScoreFilterVWAPRev or vwapRevScoreShort >= vwapRevMinScore)
+
+vwapRevLongStop = f_stopPrice(stopMode, true, close, atrVal, atrMultStop, lowerBand2, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+vwapRevShortStop = f_stopPrice(stopMode, false, close, atrVal, atrMultStop, upperBand2, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+vwapRevLongTarget = f_targetPrice(tpMode, true, close, vwapRevLongStop, vwapVal, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+vwapRevShortTarget = f_targetPrice(tpMode, false, close, vwapRevShortStop, vwapVal, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+
+// ============================================================================
+// MODULE 5 — LIQUIDITY SWEEP REVERSAL
+// ============================================================================
+sweepLongLevel = f_findSweepLongLevel(low, close, lastSwingLow, sessLow, pmLow, pdLow, orLow)
+sweepShortLevel = f_findSweepShortLevel(high, close, lastSwingHigh, sessHigh, pmHigh, pdHigh, orHigh)
+
+sweepLongRaw = not na(sweepLongLevel) and lowerWick > bodySize * 0.3
+sweepShortRaw = not na(sweepShortLevel) and upperWick > bodySize * 0.3
+
+sweepVolOK = not sweepVolFilter or volume > volAvg * 1.5
+sweepVWAPOK_Long = not sweepVWAPFilter or low <= lowerBand1
+sweepVWAPOK_Short = not sweepVWAPFilter or high >= upperBand1
+
+sweepScoreLong = f_clip100(50 + (volume > volAvg * 1.5 ? 15 : 0) + (low <= lowerBand1 ? 15 : 0) + (rsiRising ? 10 : 0))
+sweepScoreShort = f_clip100(50 + (volume > volAvg * 1.5 ? 15 : 0) + (high >= upperBand1 ? 15 : 0) + (rsiFalling ? 10 : 0))
+
+sweepLongTrigger = enableSweep and sweepLongRaw and sweepVolOK and sweepVWAPOK_Long and (not useScoreFilterSweep or sweepScoreLong >= sweepMinScore)
+sweepShortTrigger = enableSweep and sweepShortRaw and sweepVolOK and sweepVWAPOK_Short and (not useScoreFilterSweep or sweepScoreShort >= sweepMinScore)
+
+sweepLongStop = f_stopPrice(stopMode, true, close, atrVal, atrMultStop, sweepLongLevel, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+sweepShortStop = f_stopPrice(stopMode, false, close, atrVal, atrMultStop, sweepShortLevel, vwapVal, emaSlow, orHigh, orLow, customStopTicks, tick)
+sweepLongTarget = f_targetPrice(tpMode, true, close, sweepLongStop, lastSwingHigh, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+sweepShortTarget = f_targetPrice(tpMode, false, close, sweepShortStop, lastSwingLow, sessHigh, sessLow, pdHigh, pdLow, pmHigh, pmLow, orHigh, orLow)
+
+// ============================================================================
+// CONFLICT MANAGER / SIGNAL SELECTION
+// ============================================================================
+longNames = array.new<string>()
+longScores = array.new<float>()
+if emaLongTrigger
+    array.push(longNames, "EMA Long")
+    array.push(longScores, emaScoreLong)
+if orbLongTrigger
+    array.push(longNames, "ORB Long")
+    array.push(longScores, orbScoreLong)
+if vwapRevLongTrigger
+    array.push(longNames, "VWAP Rev Long")
+    array.push(longScores, vwapRevScoreLong)
+if fakeoutLongTrigger
+    array.push(longNames, "Fakeout Long")
+    array.push(longScores, fakeoutScoreLong)
+if sweepLongTrigger
+    array.push(longNames, "Sweep Long")
+    array.push(longScores, sweepScoreLong)
+
+shortNames = array.new<string>()
+shortScores = array.new<float>()
+if emaShortTrigger
+    array.push(shortNames, "EMA Short")
+    array.push(shortScores, emaScoreShort)
+if orbShortTrigger
+    array.push(shortNames, "ORB Short")
+    array.push(shortScores, orbScoreShort)
+if vwapRevShortTrigger
+    array.push(shortNames, "VWAP Rev Short")
+    array.push(shortScores, vwapRevScoreShort)
+if fakeoutShortTrigger
+    array.push(shortNames, "Fakeout Short")
+    array.push(shortScores, fakeoutScoreShort)
+if sweepShortTrigger
+    array.push(shortNames, "Sweep Short")
+    array.push(shortScores, sweepScoreShort)
+
+hasLongCandidate = array.size(longNames) > 0
+hasShortCandidate = array.size(shortNames) > 0
+
+float bestLongScore = -1.0
+string bestLongName = ""
+if hasLongCandidate
+    bestLongScore := array.max(longScores)
+    bestLongName := array.get(longNames, array.indexof(longScores, bestLongScore))
+
+float bestShortScore = -1.0
+string bestShortName = ""
+if hasShortCandidate
+    bestShortScore := array.max(shortScores)
+    bestShortName := array.get(shortNames, array.indexof(shortScores, bestShortScore))
+
+f_stopFor(name) =>
+    switch name
+        "EMA Long" => emaLongStop
+        "EMA Short" => emaShortStop
+        "ORB Long" => orbLongStop
+        "ORB Short" => orbShortStop
+        "VWAP Rev Long" => vwapRevLongStop
+        "VWAP Rev Short" => vwapRevShortStop
+        "Fakeout Long" => fakeoutLongStop
+        "Fakeout Short" => fakeoutShortStop
+        "Sweep Long" => sweepLongStop
+        "Sweep Short" => sweepShortStop
+        => na
+
+f_targetFor(name) =>
+    switch name
+        "EMA Long" => emaLongTarget
+        "EMA Short" => emaShortTarget
+        "ORB Long" => orbLongTarget
+        "ORB Short" => orbShortTarget
+        "VWAP Rev Long" => vwapRevLongTarget
+        "VWAP Rev Short" => vwapRevShortTarget
+        "Fakeout Long" => fakeoutLongTarget
+        "Fakeout Short" => fakeoutShortTarget
+        "Sweep Long" => sweepLongTarget
+        "Sweep Short" => sweepShortTarget
+        => na
+
+conflictDetected = hasLongCandidate and hasShortCandidate
+var bool conflictFlag = false
+conflictFlag := false
+
+selectedLong = false
+selectedShort = false
+selectedStrategyName = ""
+selectedScore = 0.0
+
+if conflictDetected and not allowConflictTrades
+    conflictFlag := true
+else
+    if hasLongCandidate and (not conflictDetected or bestLongScore >= bestShortScore)
+        selectedLong := true
+        selectedStrategyName := bestLongName
+        selectedScore := bestLongScore
+    else if hasShortCandidate
+        selectedShort := true
+        selectedStrategyName := bestShortName
+        selectedScore := bestShortScore
+
+selectedStopRaw = selectedLong ? f_stopFor(selectedStrategyName) : selectedShort ? f_stopFor(selectedStrategyName) : na
+selectedTargetRaw = selectedLong ? f_targetFor(selectedStrategyName) : selectedShort ? f_targetFor(selectedStrategyName) : na
+selectedStop = na(selectedStopRaw) and (selectedLong or selectedShort) ? (selectedLong ? close - atrVal * atrMultStop : close + atrVal * atrMultStop) : selectedStopRaw
+selectedTarget = na(selectedTargetRaw) and (selectedLong or selectedShort) ? (selectedLong ? close + atrVal * atrMultStop * 2 : close - atrVal * atrMultStop * 2) : selectedTargetRaw
+
+// ============================================================================
+// RISK MANAGEMENT — DAILY COUNTERS & LOCKOUT
+// ============================================================================
+var int tradesToday = 0
+var int lossesToday = 0
+var int tpCountToday = 0
+var float dailyPnL = 0.0
+var bool dailyLockout = false
+var int lastClosedCount = 0
+
+if sessionJustStarted
+    tradesToday := 0
+    lossesToday := 0
+    tpCountToday := 0
+    dailyPnL := 0.0
+    dailyLockout := false
+
+if strategy.closedtrades > lastClosedCount
+    for i = lastClosedCount to strategy.closedtrades - 1
+        tradeProfit = strategy.closedtrades.profit(i)
+        dailyPnL += tradeProfit
+        if tradeProfit < 0
+            lossesToday += 1
+        else if tradeProfit > 0
+            tpCountToday += 1
+    lastClosedCount := strategy.closedtrades
+
+if maxLossesPerDay > 0 and lossesToday >= maxLossesPerDay
+    dailyLockout := true
+if dailyLossLimit > 0 and dailyPnL <= -dailyLossLimit
+    dailyLockout := true
+if tradesToday >= maxTradesPerDay
+    dailyLockout := true
+if stopAfterTPCount > 0 and tpCountToday >= stopAfterTPCount
+    dailyLockout := true
+if stopAfterLossCount > 0 and lossesToday >= stopAfterLossCount
+    dailyLockout := true
+
+// ============================================================================
+// TRADE STATE
+// ============================================================================
+var float activeEntryPrice = na
+var float activeStopPrice = na
+var float activeTargetPrice = na
+var string activeModuleName = na
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    activeEntryPrice := na
+    activeStopPrice := na
+    activeTargetPrice := na
+    activeModuleName := na
+
+inLongPos = strategy.position_size > 0
+inShortPos = strategy.position_size < 0
+
+// ============================================================================
+// ENTRY EXECUTION
+// ============================================================================
+canEnterBase = strategy.position_size == 0 and not dailyLockout and not afterCutoff and (not restrictEntriesToSession or inSession)
+
+if canEnterBase and selectedLong and allowLongs and not na(selectedStop)
+    alertMsg = f_entryAlert(selectedStrategyName, "buy", "long", selectedStop, selectedTarget, selectedScore, qtyInput)
+    exitProfitAlert = f_exitAlert("TP")
+    exitLossAlert = f_exitAlert("SL")
+    strategy.entry(selectedStrategyName, strategy.long, qty=qtyInput, alert_message=alertMsg)
+    strategy.exit("Exit " + selectedStrategyName, from_entry=selectedStrategyName, stop=selectedStop, limit=selectedTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlert, alert_loss=exitLossAlert)
+    activeEntryPrice := close
+    activeStopPrice := selectedStop
+    activeTargetPrice := selectedTarget
+    activeModuleName := selectedStrategyName
+    tradesToday += 1
+
+if canEnterBase and selectedShort and allowShorts and not na(selectedStop)
+    alertMsgS = f_entryAlert(selectedStrategyName, "sell", "short", selectedStop, selectedTarget, selectedScore, qtyInput)
+    exitProfitAlertS = f_exitAlert("TP")
+    exitLossAlertS = f_exitAlert("SL")
+    strategy.entry(selectedStrategyName, strategy.short, qty=qtyInput, alert_message=alertMsgS)
+    strategy.exit("Exit " + selectedStrategyName, from_entry=selectedStrategyName, stop=selectedStop, limit=selectedTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlertS, alert_loss=exitLossAlertS)
+    activeEntryPrice := close
+    activeStopPrice := selectedStop
+    activeTargetPrice := selectedTarget
+    activeModuleName := selectedStrategyName
+    tradesToday += 1
+
+// ============================================================================
+// EXIT RISK SCORE (0-100, informational unless "Use Exit Risk As Actual Exit" is ON)
+// ============================================================================
+rMultipleLong = inLongPos and not na(activeEntryPrice) and not na(activeStopPrice) and (activeEntryPrice - activeStopPrice) != 0 ? (close - activeEntryPrice) / (activeEntryPrice - activeStopPrice) : na
+rMultipleShort = inShortPos and not na(activeEntryPrice) and not na(activeStopPrice) and (activeStopPrice - activeEntryPrice) != 0 ? (activeEntryPrice - close) / (activeStopPrice - activeEntryPrice) : na
+compressionReturning = emaSeparation < ta.sma(emaSeparation, 10)
+orbCloseBackInsideLong = activeModuleName == "ORB Long" and orComplete and not na(orHigh) and close < orHigh
+orbCloseBackInsideShort = activeModuleName == "ORB Short" and orComplete and not na(orLow) and close > orLow
+
+exitRiskScoreLong = math.min(100.0,
+     (close < emaFast ? 8.0 : 0.0) + (close < emaSlow ? 8.0 : 0.0) + (close < vwapVal ? 8.0 : 0.0) +
+     (rsiFalling ? 8.0 : 0.0) + (rsiVal < 50 ? 8.0 : 0.0) + (volume < volAvg ? 8.0 : 0.0) +
+     (upperBandRejection ? 8.0 : 0.0) + (upperWick > bodySize * 0.5 ? 8.0 : 0.0) + (compressionReturning ? 8.0 : 0.0) +
+     ((not na(rMultipleLong) and rMultipleLong >= 1) ? 8.0 : 0.0) + ((not na(rMultipleLong) and rMultipleLong >= 1.5) ? 8.0 : 0.0) +
+     (nearResistance ? 8.0 : 0.0) + (orbCloseBackInsideLong ? 8.0 : 0.0))
+
+exitRiskScoreShort = math.min(100.0,
+     (close > emaFast ? 8.0 : 0.0) + (close > emaSlow ? 8.0 : 0.0) + (close > vwapVal ? 8.0 : 0.0) +
+     (rsiRising ? 8.0 : 0.0) + (rsiVal > 50 ? 8.0 : 0.0) + (volume < volAvg ? 8.0 : 0.0) +
+     (lowerBandRejection ? 8.0 : 0.0) + (lowerWick > bodySize * 0.5 ? 8.0 : 0.0) + (compressionReturning ? 8.0 : 0.0) +
+     ((not na(rMultipleShort) and rMultipleShort >= 1) ? 8.0 : 0.0) + ((not na(rMultipleShort) and rMultipleShort >= 1.5) ? 8.0 : 0.0) +
+     (nearSupport ? 8.0 : 0.0) + (orbCloseBackInsideShort ? 8.0 : 0.0))
+
+exitRiskScore = inLongPos ? exitRiskScoreLong : inShortPos ? exitRiskScoreShort : 0.0
+exitRiskStatus = exitRiskScore >= exitRiskExitThreshold ? "EXIT" : exitRiskScore >= exitWarningScore ? "WARNING" : exitRiskScore >= exitWatchScore ? "WATCH" : "NORMAL"
+
+// ============================================================================
+// EMERGENCY EXITS
+// ============================================================================
+emergencyLongExit = inLongPos and (
+     (useEmergencyEMACross and emaCrossDn) or
+     (useEmergencyVWAP and vwapLossShort) or
+     (useExitRiskAsExit and exitRiskScoreLong >= exitRiskExitThreshold) or
+     (useORBFailureExit and orbCloseBackInsideLong) or
+     (useOppositeSignalExit and selectedShort))
+
+emergencyShortExit = inShortPos and (
+     (useEmergencyEMACross and emaCrossUp) or
+     (useEmergencyVWAP and vwapReclaimLong) or
+     (useExitRiskAsExit and exitRiskScoreShort >= exitRiskExitThreshold) or
+     (useORBFailureExit and orbCloseBackInsideShort) or
+     (useOppositeSignalExit and selectedLong))
+
+if emergencyLongExit
+    strategy.close_all(comment="Emergency Exit", alert_message=f_exitAlert("ExitRisk"))
+
+if emergencyShortExit
+    strategy.close_all(comment="Emergency Exit", alert_message=f_exitAlert("ExitRisk"))
+
+// ============================================================================
+// SESSION CLOSE FLATTEN
+// ============================================================================
+if flattenAtSessionEnd and sessionJustEnded and strategy.position_size != 0
+    strategy.close_all(comment="Session Close", alert_message=f_exitAlert("SessionEnd"))
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+plot(emaFast, title="EMA 9", color=color.aqua, linewidth=1)
+plot(emaSlow, title="EMA 20", color=color.orange, linewidth=1)
+plot(vwapVal, title="VWAP", color=color.blue, linewidth=1)
+plot(upperBand1, title="VWAP Upper Band 1", color=color.new(color.blue, 50))
+plot(lowerBand1, title="VWAP Lower Band 1", color=color.new(color.blue, 50))
+plot(upperBand2, title="VWAP Upper Band 2", color=color.new(color.blue, 80))
+plot(lowerBand2, title="VWAP Lower Band 2", color=color.new(color.blue, 80))
+plot(orHigh, title="OR High", color=color.new(color.orange, 20), style=plot.style_linebr)
+plot(orLow, title="OR Low", color=color.new(color.orange, 20), style=plot.style_linebr)
+plot(sessHigh, title="Session High", color=color.new(color.purple, 40), style=plot.style_linebr)
+plot(sessLow, title="Session Low", color=color.new(color.purple, 40), style=plot.style_linebr)
+plot(strategy.position_size != 0 ? activeStopPrice : na, title="Active Stop", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? activeTargetPrice : na, title="Active Target", color=color.green, style=plot.style_linebr, linewidth=1)
+
+plotshape(selectedLong, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(selectedShort, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+bgcolor(showBackground ? (selectedLong ? color.new(color.green, 85) : selectedShort ? color.new(color.red, 85) : na) : na)
+
+var label sigLabel = label.new(bar_index, na, "", style=label.style_label_up, color=color.blue)
+if selectedLong or selectedShort
+    label.set_xy(sigLabel, bar_index, selectedLong ? low - atrVal * 0.5 : high + atrVal * 0.5)
+    label.set_text(sigLabel, selectedStrategyName + "\nScore: " + str.tostring(selectedScore, "#.#"))
+    label.set_style(sigLabel, selectedLong ? label.style_label_up : label.style_label_down)
+    label.set_color(sigLabel, selectedLong ? color.new(color.green, 0) : color.new(color.red, 0))
+
+// ============================================================================
+// INFO TABLE (drawn on last bar only)
+// ============================================================================
+var table infoTable = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 80), border_width=1)
+if showTable and barstate.islast
+    table.cell(infoTable, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(infoTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 50))
+    table.cell(infoTable, 0, 11, "Market Mode Hint", text_color=color.white)
+    table.cell(infoTable, 1, 11, marketMode + ": " + f_marketHint(marketMode), text_color=color.white)
+    table.cell(infoTable, 0, 1, "Market Condition", text_color=color.white)
+    table.cell(infoTable, 1, 1, strongTrend ? "Trending" : chopScore > 60 ? "Choppy" : "Normal", text_color=color.white)
+    table.cell(infoTable, 0, 2, "Selected Strategy", text_color=color.white)
+    table.cell(infoTable, 1, 2, selectedStrategyName == "" ? "None" : selectedStrategyName, text_color=color.white)
+    table.cell(infoTable, 0, 3, "Selected Score", text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(selectedScore, "#.#"), text_color=color.white)
+    table.cell(infoTable, 0, 4, "HTF Trend", text_color=color.white)
+    table.cell(infoTable, 1, 4, htfBullish ? "Bullish" : htfBearish ? "Bearish" : "Flat", text_color=color.white)
+    table.cell(infoTable, 0, 5, "VWAP", text_color=color.white)
+    table.cell(infoTable, 1, 5, close > vwapVal ? "Above" : "Below", text_color=color.white)
+    table.cell(infoTable, 0, 6, "Chop Score", text_color=color.white)
+    table.cell(infoTable, 1, 6, str.tostring(chopScore, "#.#"), text_color=color.white)
+    table.cell(infoTable, 0, 7, "Volume", text_color=color.white)
+    table.cell(infoTable, 1, 7, str.tostring(relVol, "#.##") + "x", text_color=color.white)
+    table.cell(infoTable, 0, 8, "Room (ATR)", text_color=color.white)
+    table.cell(infoTable, 1, 8, "R:" + (na(roomToResistanceATR) ? "n/a" : str.tostring(roomToResistanceATR, "#.#")) + " S:" + (na(roomToSupportATR) ? "n/a" : str.tostring(roomToSupportATR, "#.#")), text_color=color.white)
+    table.cell(infoTable, 0, 9, "Conflict", text_color=color.white)
+    table.cell(infoTable, 1, 9, conflictFlag ? "YES" : "No", text_color=conflictFlag ? color.red : color.white)
+    table.cell(infoTable, 0, 10, "Lockout / Exit Risk", text_color=color.white)
+    table.cell(infoTable, 1, 10, (dailyLockout ? "LOCKED" : "Active") + " / " + exitRiskStatus, text_color=dailyLockout ? color.red : color.white)
