@@ -204,6 +204,16 @@ partial3PctOfOriginal = input.float(25.0, "Partial Exit at Tier 3 (% of ORIGINAL
 minTargetPctInfo = input.float(10.0, "Informational: Minimum Target % (reference only, not a hard exit)", group="Percent Risk Management")
 
 // ============================================================================
+// INPUTS — INVERSE TESTING MODE
+// ============================================================================
+useInverseMode = input.bool(true, "Enable Inverse Mode Feature (master switch)", group="Inverse Testing",
+     tooltip="Arms the inverse-testing feature. Inversion only actually happens when 'Invert Strategy Signals' below is also ON.")
+invertSignals = input.bool(false, "Invert Strategy Signals", group="Inverse Testing",
+     tooltip="When ON, a selected LONG signal enters an actual SHORT and a selected SHORT enters an actual LONG. Stop and target are recalculated for the actual trade direction using the ATR stop and R-multiple target below — the original signal's stop/target are never reused.")
+targetR = input.float(1.0, "Target R Multiple", minval=0.1, step=0.1, group="Inverse Testing")
+stopATR = input.float(2.0, "ATR Stop Multiplier", minval=0.1, step=0.05, group="Inverse Testing")
+
+// ============================================================================
 // INPUTS — EMA/VWAP CONTINUATION MODULE
 // ============================================================================
 enableEMAContinuation = input.bool(true, "Enable EMA/VWAP Continuation", group="EMA/VWAP Continuation")
@@ -717,6 +727,27 @@ if usePercentRiskManagement and (selectedLong or selectedShort)
     selectedTarget := na
 
 // ============================================================================
+// INVERSE MODE — flip actual trade direction, then recalc stop/target for the
+// ACTUAL direction (never reuse the original signal's stop/target)
+// ============================================================================
+inverseActive = useInverseMode and invertSignals
+
+actualLong = inverseActive ? selectedShort : selectedLong
+actualShort = inverseActive ? selectedLong : selectedShort
+
+string tradeID = selectedStrategyName
+string alertStratName = selectedStrategyName
+float actualStop = selectedStop
+float actualTarget = selectedTarget
+
+if inverseActive and (actualLong or actualShort)
+    tradeID := actualLong ? "Inverse Long" : "Inverse Short"
+    alertStratName := "INVERSE " + selectedStrategyName
+    riskDist = atrVal * stopATR
+    actualStop := actualLong ? close - riskDist : close + riskDist
+    actualTarget := actualLong ? close + riskDist * targetR : close - riskDist * targetR
+
+// ============================================================================
 // RISK MANAGEMENT — DAILY COUNTERS & LOCKOUT
 // ============================================================================
 var int tradesToday = 0
@@ -766,6 +797,7 @@ var bool tier1Done = false
 var bool tier2Done = false
 var bool tier3Done = false
 var float remainingFraction = 1.0
+var bool activeIsInverse = false
 
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     activeEntryPrice := na
@@ -777,6 +809,7 @@ if strategy.position_size == 0 and strategy.position_size[1] != 0
     tier2Done := false
     tier3Done := false
     remainingFraction := 1.0
+    activeIsInverse := false
 
 inLongPos = strategy.position_size > 0
 inShortPos = strategy.position_size < 0
@@ -791,16 +824,17 @@ if inShortPos
 // ============================================================================
 canEnterBase = strategy.position_size == 0 and not dailyLockout and not afterCutoff and (not restrictEntriesToSession or inSession)
 
-if canEnterBase and selectedLong and allowLongs and not na(selectedStop)
-    alertMsg = f_entryAlert(selectedStrategyName, "buy", "long", selectedStop, selectedTarget, selectedScore, qtyInput)
-    exitProfitAlert = f_exitAlert("TP")
-    exitLossAlert = f_exitAlert("SL")
-    strategy.entry(selectedStrategyName, strategy.long, qty=qtyInput, alert_message=alertMsg)
-    strategy.exit("Exit " + selectedStrategyName, from_entry=selectedStrategyName, stop=selectedStop, limit=selectedTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlert, alert_loss=exitLossAlert)
+if canEnterBase and actualLong and allowLongs and not na(actualStop)
+    alertMsg = f_entryAlert(alertStratName, "buy", "long", actualStop, actualTarget, selectedScore, qtyInput)
+    exitProfitAlert = f_exitAlert(inverseActive ? "INVERSE TP" : "TP")
+    exitLossAlert = f_exitAlert(inverseActive ? "INVERSE SL" : "SL")
+    strategy.entry(tradeID, strategy.long, qty=qtyInput, alert_message=alertMsg)
+    strategy.exit("Exit " + tradeID, from_entry=tradeID, stop=actualStop, limit=actualTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlert, alert_loss=exitLossAlert)
     activeEntryPrice := close
-    activeStopPrice := selectedStop
-    activeTargetPrice := selectedTarget
-    activeModuleName := selectedStrategyName
+    activeStopPrice := actualStop
+    activeTargetPrice := actualTarget
+    activeModuleName := tradeID
+    activeIsInverse := inverseActive
     peakSinceEntry := high
     tier1Done := false
     tier2Done := false
@@ -808,16 +842,17 @@ if canEnterBase and selectedLong and allowLongs and not na(selectedStop)
     remainingFraction := 1.0
     tradesToday += 1
 
-if canEnterBase and selectedShort and allowShorts and not na(selectedStop)
-    alertMsgS = f_entryAlert(selectedStrategyName, "sell", "short", selectedStop, selectedTarget, selectedScore, qtyInput)
-    exitProfitAlertS = f_exitAlert("TP")
-    exitLossAlertS = f_exitAlert("SL")
-    strategy.entry(selectedStrategyName, strategy.short, qty=qtyInput, alert_message=alertMsgS)
-    strategy.exit("Exit " + selectedStrategyName, from_entry=selectedStrategyName, stop=selectedStop, limit=selectedTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlertS, alert_loss=exitLossAlertS)
+if canEnterBase and actualShort and allowShorts and not na(actualStop)
+    alertMsgS = f_entryAlert(alertStratName, "sell", "short", actualStop, actualTarget, selectedScore, qtyInput)
+    exitProfitAlertS = f_exitAlert(inverseActive ? "INVERSE TP" : "TP")
+    exitLossAlertS = f_exitAlert(inverseActive ? "INVERSE SL" : "SL")
+    strategy.entry(tradeID, strategy.short, qty=qtyInput, alert_message=alertMsgS)
+    strategy.exit("Exit " + tradeID, from_entry=tradeID, stop=actualStop, limit=actualTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlertS, alert_loss=exitLossAlertS)
     activeEntryPrice := close
-    activeStopPrice := selectedStop
-    activeTargetPrice := selectedTarget
-    activeModuleName := selectedStrategyName
+    activeStopPrice := actualStop
+    activeTargetPrice := actualTarget
+    activeModuleName := tradeID
+    activeIsInverse := inverseActive
     peakSinceEntry := low
     tier1Done := false
     tier2Done := false
@@ -841,7 +876,7 @@ if not na(profitPctPeak)
     else if breakevenTriggerPct > 0 and profitPctPeak >= breakevenTriggerPct
         ratchetFloorPct := breakevenFloorPct
 
-if usePercentRiskManagement and (inLongPos or inShortPos) and not na(activeEntryPrice)
+if usePercentRiskManagement and not activeIsInverse and (inLongPos or inShortPos) and not na(activeEntryPrice)
     stopPctActive = na(ratchetFloorPct) ? -stopLossPct : ratchetFloorPct
     dynStop = inLongPos ? activeEntryPrice * (1 + stopPctActive / 100) : activeEntryPrice * (1 - stopPctActive / 100)
     strategy.exit("Exit " + activeModuleName, from_entry=activeModuleName, stop=dynStop, alert_message=f_exitAlert(na(ratchetFloorPct) ? "SL" : "TrailFloor"))
@@ -903,14 +938,14 @@ emergencyLongExit = inLongPos and (
      (useEmergencyVWAP and vwapLossShort) or
      (useExitRiskAsExit and exitRiskScoreLong >= exitRiskExitThreshold) or
      (useORBFailureExit and orbCloseBackInsideLong) or
-     (useOppositeSignalExit and selectedShort))
+     (useOppositeSignalExit and actualShort))
 
 emergencyShortExit = inShortPos and (
      (useEmergencyEMACross and emaCrossUp) or
      (useEmergencyVWAP and vwapReclaimLong) or
      (useExitRiskAsExit and exitRiskScoreShort >= exitRiskExitThreshold) or
      (useORBFailureExit and orbCloseBackInsideShort) or
-     (useOppositeSignalExit and selectedLong))
+     (useOppositeSignalExit and actualLong))
 
 if emergencyLongExit
     strategy.close_all(comment="Emergency Exit", alert_message=f_exitAlert("ExitRisk"))
@@ -941,23 +976,31 @@ plot(sessLow, title="Session Low", color=color.new(color.purple, 40), style=plot
 plot(strategy.position_size != 0 ? activeStopPrice : na, title="Active Stop", color=color.red, style=plot.style_linebr, linewidth=1)
 plot(strategy.position_size != 0 ? activeTargetPrice : na, title="Active Target", color=color.green, style=plot.style_linebr, linewidth=1)
 
-plotshape(selectedLong, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
-plotshape(selectedShort, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(actualLong, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(actualShort, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
 
-bgcolor(showBackground ? (selectedLong ? color.new(color.green, 85) : selectedShort ? color.new(color.red, 85) : na) : na)
+bgcolor(showBackground ? (actualLong ? color.new(color.green, 85) : actualShort ? color.new(color.red, 85) : na) : na)
 
 var label sigLabel = label.new(bar_index, na, "", style=label.style_label_up, color=color.blue)
-if selectedLong or selectedShort
-    label.set_xy(sigLabel, bar_index, selectedLong ? low - atrVal * 0.5 : high + atrVal * 0.5)
-    label.set_text(sigLabel, selectedStrategyName + "\nScore: " + str.tostring(selectedScore, "#.#"))
-    label.set_style(sigLabel, selectedLong ? label.style_label_up : label.style_label_down)
-    label.set_color(sigLabel, selectedLong ? color.new(color.green, 0) : color.new(color.red, 0))
+if actualLong or actualShort
+    label.set_xy(sigLabel, bar_index, actualLong ? low - atrVal * 0.5 : high + atrVal * 0.5)
+    label.set_text(sigLabel, (inverseActive ? "INVERSE " : "") + selectedStrategyName + (inverseActive ? " → " + (actualLong ? "LONG" : "SHORT") : "") + "\nScore: " + str.tostring(selectedScore, "#.#"))
+    label.set_style(sigLabel, actualLong ? label.style_label_up : label.style_label_down)
+    label.set_color(sigLabel, actualLong ? color.new(color.green, 0) : color.new(color.red, 0))
 
 // ============================================================================
 // INFO TABLE (drawn on last bar only)
 // ============================================================================
-var table infoTable = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 80), border_width=1)
+var table infoTable = table.new(position.top_right, 2, 17, bgcolor=color.new(color.black, 80), border_width=1)
 if showTable and barstate.islast
+    tblStop = strategy.position_size != 0 ? activeStopPrice : actualStop
+    tblTarget = strategy.position_size != 0 ? activeTargetPrice : actualTarget
+    table.cell(infoTable, 0, 14, "Mode", text_color=color.white)
+    table.cell(infoTable, 1, 14, inverseActive ? "INVERSE" : "Normal", text_color=inverseActive ? color.yellow : color.white)
+    table.cell(infoTable, 0, 15, "Signal → Trade", text_color=color.white)
+    table.cell(infoTable, 1, 15, (selectedStrategyName == "" ? "None" : selectedStrategyName) + " → " + (actualLong ? "LONG" : actualShort ? "SHORT" : strategy.position_size > 0 ? "in LONG" : strategy.position_size < 0 ? "in SHORT" : "Flat"), text_color=color.white)
+    table.cell(infoTable, 0, 16, "Stop / Target", text_color=color.white)
+    table.cell(infoTable, 1, 16, (na(tblStop) ? "n/a" : str.tostring(tblStop, format.mintick)) + " / " + (na(tblTarget) ? "trail" : str.tostring(tblTarget, format.mintick)), text_color=color.white)
     table.cell(infoTable, 0, 12, "Position P&L (peak/current) %", text_color=color.white)
     table.cell(infoTable, 1, 12, (inLongPos or inShortPos) ? str.tostring(profitPctPeak, "#.#") + "% / " + str.tostring(inLongPos ? (close - activeEntryPrice) / activeEntryPrice * 100 : (activeEntryPrice - close) / activeEntryPrice * 100, "#.#") + "%" : "Flat", text_color=color.white)
     table.cell(infoTable, 0, 13, "Ratchet Floor / Remaining", text_color=color.white)
