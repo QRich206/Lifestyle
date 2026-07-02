@@ -125,6 +125,9 @@ f_entryAlert(stratName, action, side, stopPx, targetPx, score, qty) =>
 f_exitAlert(reason) =>
     '{"symbol":"{{ticker}}","strategy":"Exit","action":"close","reason":"' + reason + '","time":"{{time}}"}'
 
+f_partialExitAlert(reason, qtyPercent) =>
+    '{"symbol":"{{ticker}}","strategy":"Exit","action":"partial_close","reason":"' + reason + '","qty_percent":"' + str.tostring(qtyPercent, "#.##") + '","time":"{{time}}"}'
+
 f_marketHint(mode) =>
     switch mode
         "ES/MES" => "ATR 1.5-2.0 | Score 65-70"
@@ -177,6 +180,28 @@ atrLen = input.int(14, "ATR Length", minval=1, group="Stop Loss / Take Profit")
 atrMultStop = input.float(2.0, "ATR Stop Multiplier", minval=0.1, step=0.05, group="Stop Loss / Take Profit",
      tooltip="Suggested ranges — ES/MES 1.5-2.0 | NQ/MNQ 2.0-2.75 | YM/MYM 1.5-2.0 | CL/MCL 2.25-3.0 | GC/MGC 1.75-2.5")
 customStopTicks = input.float(40, "Custom Fallback Stop (ticks)", minval=1, group="Stop Loss / Take Profit")
+
+// ============================================================================
+// INPUTS — PERCENT RISK MANAGEMENT (overrides ATR/Structure stop & target for ALL modules when ON)
+// ============================================================================
+usePercentRiskManagement = input.bool(true, "Use Percent-Based Risk Management (overrides ATR/Structure stop & target)", group="Percent Risk Management",
+     tooltip="When ON, every module's entry uses a fixed % stop plus a stairstep trailing floor instead of the ATR/Structure stop & fixed-R target above. Designed for instruments where 15-100%+ intraday swings are realistic (e.g. option premium) — on SPY/ES share price itself these thresholds will rarely trigger.")
+stopLossPct = input.float(15.0, "Hard Stop Loss % (from entry)", minval=0.1, group="Percent Risk Management")
+breakevenTriggerPct = input.float(10.0, "Lock-In Trigger — Peak Profit % (0 = disabled)", minval=0, group="Percent Risk Management",
+     tooltip="Once peak profit reaches this %, the stop moves up from the hard stop to the Lock-In Floor % below, protecting at least that much profit before the 30/50/100 ratchet tiers take over.")
+breakevenFloorPct = input.float(5.0, "Lock-In Floor % (profit protected once trigger is hit)", group="Percent Risk Management")
+ratchetTier1Trigger = input.float(30.0, "Ratchet Tier 1 — Trigger Peak Profit %", minval=0, group="Percent Risk Management")
+ratchetTier1Floor = input.float(30.0, "Ratchet Tier 1 — Trailing Floor %", group="Percent Risk Management")
+ratchetTier2Trigger = input.float(50.0, "Ratchet Tier 2 — Trigger Peak Profit %", minval=0, group="Percent Risk Management")
+ratchetTier2Floor = input.float(50.0, "Ratchet Tier 2 — Trailing Floor %", group="Percent Risk Management")
+ratchetTier3Trigger = input.float(100.0, "Ratchet Tier 3 — Trigger Peak Profit %", minval=0, group="Percent Risk Management")
+ratchetTier3Floor = input.float(100.0, "Ratchet Tier 3 — Trailing Floor %", group="Percent Risk Management")
+usePartialExits = input.bool(true, "Enable Partial Profit-Taking At Each Ratchet Tier", group="Percent Risk Management")
+partial1PctOfOriginal = input.float(25.0, "Partial Exit at Tier 1 (% of ORIGINAL position size)", minval=0, maxval=100, group="Percent Risk Management")
+partial2PctOfOriginal = input.float(25.0, "Partial Exit at Tier 2 (% of ORIGINAL position size)", minval=0, maxval=100, group="Percent Risk Management")
+partial3PctOfOriginal = input.float(25.0, "Partial Exit at Tier 3 (% of ORIGINAL position size)", minval=0, maxval=100, group="Percent Risk Management",
+     tooltip="Whatever fraction of the original position remains after all tiers keeps running under the Tier 3 trailing floor indefinitely. Note: qty_percent partial closes need enough contracts/shares to actually split — 1-contract positions cannot be partially closed.")
+minTargetPctInfo = input.float(10.0, "Informational: Minimum Target % (reference only, not a hard exit)", group="Percent Risk Management")
 
 // ============================================================================
 // INPUTS — EMA/VWAP CONTINUATION MODULE
@@ -684,8 +709,12 @@ else
 
 selectedStopRaw = selectedLong ? f_stopFor(selectedStrategyName) : selectedShort ? f_stopFor(selectedStrategyName) : na
 selectedTargetRaw = selectedLong ? f_targetFor(selectedStrategyName) : selectedShort ? f_targetFor(selectedStrategyName) : na
-selectedStop = na(selectedStopRaw) and (selectedLong or selectedShort) ? (selectedLong ? close - atrVal * atrMultStop : close + atrVal * atrMultStop) : selectedStopRaw
-selectedTarget = na(selectedTargetRaw) and (selectedLong or selectedShort) ? (selectedLong ? close + atrVal * atrMultStop * 2 : close - atrVal * atrMultStop * 2) : selectedTargetRaw
+float selectedStop = na(selectedStopRaw) and (selectedLong or selectedShort) ? (selectedLong ? close - atrVal * atrMultStop : close + atrVal * atrMultStop) : selectedStopRaw
+float selectedTarget = na(selectedTargetRaw) and (selectedLong or selectedShort) ? (selectedLong ? close + atrVal * atrMultStop * 2 : close - atrVal * atrMultStop * 2) : selectedTargetRaw
+
+if usePercentRiskManagement and (selectedLong or selectedShort)
+    selectedStop := selectedLong ? close * (1 - stopLossPct / 100) : close * (1 + stopLossPct / 100)
+    selectedTarget := na
 
 // ============================================================================
 // RISK MANAGEMENT — DAILY COUNTERS & LOCKOUT
@@ -732,15 +761,30 @@ var float activeEntryPrice = na
 var float activeStopPrice = na
 var float activeTargetPrice = na
 var string activeModuleName = na
+var float peakSinceEntry = na
+var bool tier1Done = false
+var bool tier2Done = false
+var bool tier3Done = false
+var float remainingFraction = 1.0
 
 if strategy.position_size == 0 and strategy.position_size[1] != 0
     activeEntryPrice := na
     activeStopPrice := na
     activeTargetPrice := na
     activeModuleName := na
+    peakSinceEntry := na
+    tier1Done := false
+    tier2Done := false
+    tier3Done := false
+    remainingFraction := 1.0
 
 inLongPos = strategy.position_size > 0
 inShortPos = strategy.position_size < 0
+
+if inLongPos
+    peakSinceEntry := na(peakSinceEntry) ? high : math.max(peakSinceEntry, high)
+if inShortPos
+    peakSinceEntry := na(peakSinceEntry) ? low : math.min(peakSinceEntry, low)
 
 // ============================================================================
 // ENTRY EXECUTION
@@ -757,6 +801,11 @@ if canEnterBase and selectedLong and allowLongs and not na(selectedStop)
     activeStopPrice := selectedStop
     activeTargetPrice := selectedTarget
     activeModuleName := selectedStrategyName
+    peakSinceEntry := high
+    tier1Done := false
+    tier2Done := false
+    tier3Done := false
+    remainingFraction := 1.0
     tradesToday += 1
 
 if canEnterBase and selectedShort and allowShorts and not na(selectedStop)
@@ -769,7 +818,56 @@ if canEnterBase and selectedShort and allowShorts and not na(selectedStop)
     activeStopPrice := selectedStop
     activeTargetPrice := selectedTarget
     activeModuleName := selectedStrategyName
+    peakSinceEntry := low
+    tier1Done := false
+    tier2Done := false
+    tier3Done := false
+    remainingFraction := 1.0
     tradesToday += 1
+
+// ============================================================================
+// PERCENT RISK MANAGEMENT — STAIRSTEP TRAILING FLOOR + PARTIAL PROFIT TAKING
+// ============================================================================
+profitPctPeak = inLongPos and not na(activeEntryPrice) and not na(peakSinceEntry) ? (peakSinceEntry - activeEntryPrice) / activeEntryPrice * 100 : inShortPos and not na(activeEntryPrice) and not na(peakSinceEntry) ? (activeEntryPrice - peakSinceEntry) / activeEntryPrice * 100 : na
+
+float ratchetFloorPct = na
+if not na(profitPctPeak)
+    if profitPctPeak >= ratchetTier3Trigger
+        ratchetFloorPct := ratchetTier3Floor
+    else if profitPctPeak >= ratchetTier2Trigger
+        ratchetFloorPct := ratchetTier2Floor
+    else if profitPctPeak >= ratchetTier1Trigger
+        ratchetFloorPct := ratchetTier1Floor
+    else if breakevenTriggerPct > 0 and profitPctPeak >= breakevenTriggerPct
+        ratchetFloorPct := breakevenFloorPct
+
+if usePercentRiskManagement and (inLongPos or inShortPos) and not na(activeEntryPrice)
+    stopPctActive = na(ratchetFloorPct) ? -stopLossPct : ratchetFloorPct
+    dynStop = inLongPos ? activeEntryPrice * (1 + stopPctActive / 100) : activeEntryPrice * (1 - stopPctActive / 100)
+    strategy.exit("Exit " + activeModuleName, from_entry=activeModuleName, stop=dynStop, alert_message=f_exitAlert(na(ratchetFloorPct) ? "SL" : "TrailFloor"))
+
+    if usePartialExits and not na(profitPctPeak)
+        if not tier1Done and profitPctPeak >= ratchetTier1Trigger
+            closeFrac1 = partial1PctOfOriginal / 100
+            qtyPct1 = remainingFraction > 0 ? math.min(100.0, closeFrac1 / remainingFraction * 100) : 0.0
+            if qtyPct1 > 0
+                strategy.close(activeModuleName, qty_percent=qtyPct1, comment="Partial TP1", alert_message=f_partialExitAlert("PartialTP1", qtyPct1))
+            remainingFraction := math.max(0.0, remainingFraction - closeFrac1)
+            tier1Done := true
+        if not tier2Done and profitPctPeak >= ratchetTier2Trigger
+            closeFrac2 = partial2PctOfOriginal / 100
+            qtyPct2 = remainingFraction > 0 ? math.min(100.0, closeFrac2 / remainingFraction * 100) : 0.0
+            if qtyPct2 > 0
+                strategy.close(activeModuleName, qty_percent=qtyPct2, comment="Partial TP2", alert_message=f_partialExitAlert("PartialTP2", qtyPct2))
+            remainingFraction := math.max(0.0, remainingFraction - closeFrac2)
+            tier2Done := true
+        if not tier3Done and profitPctPeak >= ratchetTier3Trigger
+            closeFrac3 = partial3PctOfOriginal / 100
+            qtyPct3 = remainingFraction > 0 ? math.min(100.0, closeFrac3 / remainingFraction * 100) : 0.0
+            if qtyPct3 > 0
+                strategy.close(activeModuleName, qty_percent=qtyPct3, comment="Partial TP3", alert_message=f_partialExitAlert("PartialTP3", qtyPct3))
+            remainingFraction := math.max(0.0, remainingFraction - closeFrac3)
+            tier3Done := true
 
 // ============================================================================
 // EXIT RISK SCORE (0-100, informational unless "Use Exit Risk As Actual Exit" is ON)
@@ -858,8 +956,12 @@ if selectedLong or selectedShort
 // ============================================================================
 // INFO TABLE (drawn on last bar only)
 // ============================================================================
-var table infoTable = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 80), border_width=1)
+var table infoTable = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 80), border_width=1)
 if showTable and barstate.islast
+    table.cell(infoTable, 0, 12, "Position P&L (peak/current) %", text_color=color.white)
+    table.cell(infoTable, 1, 12, (inLongPos or inShortPos) ? str.tostring(profitPctPeak, "#.#") + "% / " + str.tostring(inLongPos ? (close - activeEntryPrice) / activeEntryPrice * 100 : (activeEntryPrice - close) / activeEntryPrice * 100, "#.#") + "%" : "Flat", text_color=color.white)
+    table.cell(infoTable, 0, 13, "Ratchet Floor / Remaining", text_color=color.white)
+    table.cell(infoTable, 1, 13, (usePercentRiskManagement and (inLongPos or inShortPos)) ? (na(ratchetFloorPct) ? "Hard Stop -" + str.tostring(stopLossPct, "#.#") + "%" : str.tostring(ratchetFloorPct, "#.#") + "% floor") + " / " + str.tostring(remainingFraction * 100, "#.#") + "%" : "n/a", text_color=color.white)
     table.cell(infoTable, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.gray, 50))
     table.cell(infoTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 50))
     table.cell(infoTable, 0, 11, "Market Mode Hint", text_color=color.white)
