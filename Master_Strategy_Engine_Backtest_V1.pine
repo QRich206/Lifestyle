@@ -214,6 +214,18 @@ targetR = input.float(1.0, "Target R Multiple", minval=0.1, step=0.1, group="Inv
 stopATR = input.float(2.0, "ATR Stop Multiplier", minval=0.1, step=0.05, group="Inverse Testing")
 
 // ============================================================================
+// INPUTS — EXECUTION ENGINE (UT Bot ATR trailing stop as optional entry timing)
+// ============================================================================
+useUTExecution = input.bool(true, "Use UT Bot Execution Trigger", group="Execution Engine",
+     tooltip="When ON, a module signal only fires an entry on the same bar UT Bot flips in that direction — module signals decide WHAT to trade, UT Bot decides WHEN. When OFF, the confirmed module signal enters directly as before.")
+utMult = input.float(1.0, "UT ATR Multiplier", group="Execution Engine")
+utAtrLen = input.int(10, "UT ATR Period", group="Execution Engine")
+utSource = input.source(close, "UT Source", group="Execution Engine")
+showUTStop = input.bool(true, "Show UT Trailing Stop", group="Execution Engine")
+exitMode = input.string("ATR TP/SL", "Exit Mode", options=["ATR TP/SL", "Opposite Signal", "UT Trailing Stop"], group="Execution Engine",
+     tooltip="ATR TP/SL keeps existing stop/target + percent-risk ratchet. UT Trailing Stop exits on the UT line. Opposite Signal keeps the hard stop and also closes on the opposite UT flip.")
+
+// ============================================================================
 // INPUTS — EMA/VWAP CONTINUATION MODULE
 // ============================================================================
 enableEMAContinuation = input.bool(true, "Enable EMA/VWAP Continuation", group="EMA/VWAP Continuation")
@@ -341,6 +353,18 @@ relVol = volAvg > 0 ? volume / volAvg : 1.0
 volConfirm = volume > volAvg * volMultEMA
 
 atrVal = ta.atr(atrLen)
+
+// ---- UT Bot ATR Trailing Stop (execution-timing engine) ----
+utAtr = ta.atr(utAtrLen)
+utLoss = utMult * utAtr
+var float utStop = na
+float utPrev = nz(utStop[1], utSource)
+utStop := utSource > utPrev and utSource[1] > utPrev ? math.max(utPrev, utSource - utLoss) :
+     utSource < utPrev and utSource[1] < utPrev ? math.min(utPrev, utSource + utLoss) :
+     utSource > utPrev ? utSource - utLoss : utSource + utLoss
+utBullTrend = utSource > utStop
+utBuy = ta.crossover(utSource, utStop) and barstate.isconfirmed
+utSell = ta.crossunder(utSource, utStop) and barstate.isconfirmed
 
 barRange = high - low
 bodySize = math.abs(close - open)
@@ -748,6 +772,15 @@ if inverseActive and (actualLong or actualShort)
     actualTarget := actualLong ? close + riskDist * targetR : close - riskDist * targetR
 
 // ============================================================================
+// EXECUTION ENGINE — UT Bot gates the confirmed module signal into a final signal
+// (module/scoring/conflict/inverse pipeline above is the CONFIRMATION; UT is the TIMING)
+// ============================================================================
+confirmedLong = actualLong
+confirmedShort = actualShort
+finalLongSignal = useUTExecution ? confirmedLong and utBuy : confirmedLong
+finalShortSignal = useUTExecution ? confirmedShort and utSell : confirmedShort
+
+// ============================================================================
 // RISK MANAGEMENT — DAILY COUNTERS & LOCKOUT
 // ============================================================================
 var int tradesToday = 0
@@ -824,15 +857,20 @@ if inShortPos
 // ============================================================================
 canEnterBase = strategy.position_size == 0 and not dailyLockout and not afterCutoff and (not restrictEntriesToSession or inSession)
 
-if canEnterBase and actualLong and allowLongs and not na(actualStop)
-    alertMsg = f_entryAlert(alertStratName, "buy", "long", actualStop, actualTarget, selectedScore, qtyInput)
+// Entry protective stop/target depend on exit mode. A stop is ALWAYS submitted.
+entryStopLong = exitMode == "UT Trailing Stop" ? utStop : actualStop
+entryStopShort = exitMode == "UT Trailing Stop" ? utStop : actualStop
+entryLimit = exitMode == "ATR TP/SL" ? actualTarget : na
+
+if canEnterBase and finalLongSignal and allowLongs and not na(entryStopLong)
+    alertMsg = f_entryAlert(alertStratName, "buy", "long", entryStopLong, entryLimit, selectedScore, qtyInput)
     exitProfitAlert = f_exitAlert(inverseActive ? "INVERSE TP" : "TP")
     exitLossAlert = f_exitAlert(inverseActive ? "INVERSE SL" : "SL")
     strategy.entry(tradeID, strategy.long, qty=qtyInput, alert_message=alertMsg)
-    strategy.exit("Exit " + tradeID, from_entry=tradeID, stop=actualStop, limit=actualTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlert, alert_loss=exitLossAlert)
+    strategy.exit("Exit " + tradeID, from_entry=tradeID, stop=entryStopLong, limit=entryLimit, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlert, alert_loss=exitLossAlert)
     activeEntryPrice := close
-    activeStopPrice := actualStop
-    activeTargetPrice := actualTarget
+    activeStopPrice := entryStopLong
+    activeTargetPrice := entryLimit
     activeModuleName := tradeID
     activeIsInverse := inverseActive
     peakSinceEntry := high
@@ -842,15 +880,15 @@ if canEnterBase and actualLong and allowLongs and not na(actualStop)
     remainingFraction := 1.0
     tradesToday += 1
 
-if canEnterBase and actualShort and allowShorts and not na(actualStop)
-    alertMsgS = f_entryAlert(alertStratName, "sell", "short", actualStop, actualTarget, selectedScore, qtyInput)
+if canEnterBase and finalShortSignal and allowShorts and not na(entryStopShort)
+    alertMsgS = f_entryAlert(alertStratName, "sell", "short", entryStopShort, entryLimit, selectedScore, qtyInput)
     exitProfitAlertS = f_exitAlert(inverseActive ? "INVERSE TP" : "TP")
     exitLossAlertS = f_exitAlert(inverseActive ? "INVERSE SL" : "SL")
     strategy.entry(tradeID, strategy.short, qty=qtyInput, alert_message=alertMsgS)
-    strategy.exit("Exit " + tradeID, from_entry=tradeID, stop=actualStop, limit=actualTarget, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlertS, alert_loss=exitLossAlertS)
+    strategy.exit("Exit " + tradeID, from_entry=tradeID, stop=entryStopShort, limit=entryLimit, comment_profit="TP", comment_loss="SL", alert_profit=exitProfitAlertS, alert_loss=exitLossAlertS)
     activeEntryPrice := close
-    activeStopPrice := actualStop
-    activeTargetPrice := actualTarget
+    activeStopPrice := entryStopShort
+    activeTargetPrice := entryLimit
     activeModuleName := tradeID
     activeIsInverse := inverseActive
     peakSinceEntry := low
@@ -859,6 +897,19 @@ if canEnterBase and actualShort and allowShorts and not na(actualStop)
     tier3Done := false
     remainingFraction := 1.0
     tradesToday += 1
+
+// ============================================================================
+// EXECUTION ENGINE — EXIT MANAGEMENT (UT trailing / opposite-signal close)
+// ============================================================================
+if exitMode == "UT Trailing Stop" and (inLongPos or inShortPos) and not na(activeModuleName)
+    activeStopPrice := utStop
+    strategy.exit("Exit " + activeModuleName, from_entry=activeModuleName, stop=utStop, alert_message=f_exitAlert("UTTrail"))
+
+if exitMode == "Opposite Signal"
+    if inLongPos and utSell
+        strategy.close(activeModuleName, comment="UT Opposite", alert_message=f_exitAlert("OppositeSignal"))
+    if inShortPos and utBuy
+        strategy.close(activeModuleName, comment="UT Opposite", alert_message=f_exitAlert("OppositeSignal"))
 
 // ============================================================================
 // PERCENT RISK MANAGEMENT — STAIRSTEP TRAILING FLOOR + PARTIAL PROFIT TAKING
@@ -876,7 +927,7 @@ if not na(profitPctPeak)
     else if breakevenTriggerPct > 0 and profitPctPeak >= breakevenTriggerPct
         ratchetFloorPct := breakevenFloorPct
 
-if usePercentRiskManagement and not activeIsInverse and (inLongPos or inShortPos) and not na(activeEntryPrice)
+if exitMode == "ATR TP/SL" and usePercentRiskManagement and not activeIsInverse and (inLongPos or inShortPos) and not na(activeEntryPrice)
     stopPctActive = na(ratchetFloorPct) ? -stopLossPct : ratchetFloorPct
     dynStop = inLongPos ? activeEntryPrice * (1 + stopPctActive / 100) : activeEntryPrice * (1 - stopPctActive / 100)
     strategy.exit("Exit " + activeModuleName, from_entry=activeModuleName, stop=dynStop, alert_message=f_exitAlert(na(ratchetFloorPct) ? "SL" : "TrailFloor"))
@@ -975,26 +1026,39 @@ plot(sessHigh, title="Session High", color=color.new(color.purple, 40), style=pl
 plot(sessLow, title="Session Low", color=color.new(color.purple, 40), style=plot.style_linebr)
 plot(strategy.position_size != 0 ? activeStopPrice : na, title="Active Stop", color=color.red, style=plot.style_linebr, linewidth=1)
 plot(strategy.position_size != 0 ? activeTargetPrice : na, title="Active Target", color=color.green, style=plot.style_linebr, linewidth=1)
+plot(showUTStop ? utStop : na, title="UT Trailing Stop", color=utBullTrend ? color.new(color.green, 0) : color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+plotshape(showUTStop and utBuy, title="UT Buy Flip", style=shape.circle, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showUTStop and utSell, title="UT Sell Flip", style=shape.circle, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
 
-plotshape(actualLong, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
-plotshape(actualShort, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(finalLongSignal, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(finalShortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
 
-bgcolor(showBackground ? (actualLong ? color.new(color.green, 85) : actualShort ? color.new(color.red, 85) : na) : na)
+bgcolor(showBackground ? (finalLongSignal ? color.new(color.green, 85) : finalShortSignal ? color.new(color.red, 85) : na) : na)
 
 var label sigLabel = label.new(bar_index, na, "", style=label.style_label_up, color=color.blue)
-if actualLong or actualShort
-    label.set_xy(sigLabel, bar_index, actualLong ? low - atrVal * 0.5 : high + atrVal * 0.5)
-    label.set_text(sigLabel, (inverseActive ? "INVERSE " : "") + selectedStrategyName + (inverseActive ? " → " + (actualLong ? "LONG" : "SHORT") : "") + "\nScore: " + str.tostring(selectedScore, "#.#"))
-    label.set_style(sigLabel, actualLong ? label.style_label_up : label.style_label_down)
-    label.set_color(sigLabel, actualLong ? color.new(color.green, 0) : color.new(color.red, 0))
+if finalLongSignal or finalShortSignal
+    label.set_xy(sigLabel, bar_index, finalLongSignal ? low - atrVal * 0.5 : high + atrVal * 0.5)
+    label.set_text(sigLabel, (inverseActive ? "INVERSE " : "") + selectedStrategyName + (inverseActive ? " → " + (finalLongSignal ? "LONG" : "SHORT") : "") + (useUTExecution ? " [UT]" : "") + "\nScore: " + str.tostring(selectedScore, "#.#"))
+    label.set_style(sigLabel, finalLongSignal ? label.style_label_up : label.style_label_down)
+    label.set_color(sigLabel, finalLongSignal ? color.new(color.green, 0) : color.new(color.red, 0))
 
 // ============================================================================
 // INFO TABLE (drawn on last bar only)
 // ============================================================================
-var table infoTable = table.new(position.top_right, 2, 17, bgcolor=color.new(color.black, 80), border_width=1)
+var table infoTable = table.new(position.top_right, 2, 22, bgcolor=color.new(color.black, 80), border_width=1)
 if showTable and barstate.islast
     tblStop = strategy.position_size != 0 ? activeStopPrice : actualStop
     tblTarget = strategy.position_size != 0 ? activeTargetPrice : actualTarget
+    table.cell(infoTable, 0, 17, "Execution Engine", text_color=color.white)
+    table.cell(infoTable, 1, 17, useUTExecution ? "UT" : "Raw", text_color=useUTExecution ? color.aqua : color.white)
+    table.cell(infoTable, 0, 18, "UT Trend", text_color=color.white)
+    table.cell(infoTable, 1, 18, utBullTrend ? "Bull" : "Bear", text_color=utBullTrend ? color.green : color.red)
+    table.cell(infoTable, 0, 19, "Exit Mode", text_color=color.white)
+    table.cell(infoTable, 1, 19, exitMode, text_color=color.white)
+    table.cell(infoTable, 0, 20, "Final Long Signal", text_color=color.white)
+    table.cell(infoTable, 1, 20, finalLongSignal ? "true" : "false", text_color=finalLongSignal ? color.green : color.white)
+    table.cell(infoTable, 0, 21, "Final Short Signal", text_color=color.white)
+    table.cell(infoTable, 1, 21, finalShortSignal ? "true" : "false", text_color=finalShortSignal ? color.red : color.white)
     table.cell(infoTable, 0, 14, "Mode", text_color=color.white)
     table.cell(infoTable, 1, 14, inverseActive ? "INVERSE" : "Normal", text_color=inverseActive ? color.yellow : color.white)
     table.cell(infoTable, 0, 15, "Signal → Trade", text_color=color.white)
